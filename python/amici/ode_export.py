@@ -40,6 +40,8 @@ from . import (
     sbml_import
 )
 from .logging import get_logger, log_execution_time, set_log_level
+from .splines import spline_user_functions, UniformGrid
+from .sbml_utils import sbml_time_symbol, amici_time_symbol
 
 # Template for model simulation main.cpp file
 CXX_MAIN_TEMPLATE_FILE = os.path.join(amiciSrcPath, 'main.template.cpp')
@@ -89,15 +91,48 @@ functions = {
         'signature':
             '(realtype *dwdp, const realtype t, const realtype *x, '
             'const realtype *p, const realtype *k, const realtype *h, '
-            'const realtype *w, const realtype *tcl, const realtype *dtcldp)',
+            'const realtype *w, const realtype *tcl, const realtype *dtcldp,'
+            'const realtype *spl, const realtype *sspl)',
         'flags': ['assume_pow_positivity', 'sparse']
     },
     'dwdx': {
         'signature':
             '(realtype *dwdx, const realtype t, const realtype *x, '
             'const realtype *p, const realtype *k, const realtype *h, '
-            'const realtype *w, const realtype *tcl)',
+            'const realtype *w, const realtype *tcl, '
+            'const realtype *spl)',
         'flags': ['assume_pow_positivity', 'sparse']
+    },
+    'spline_constructors': {
+        'signature':
+            '(const realtype *p, const realtype *k)',
+        'flags': ['dont_generate_body']
+    },
+    'spl': {
+        'signature': '()',
+        'flags': ['dont_generate_body']
+    },
+    'sspl': {
+        'signature': '()',
+        'flags': ['dont_generate_body']
+    },
+    'spline_values': {
+        'signature':
+            '(const realtype *p, const realtype *k)',
+        'flags': ['dont_generate_body']
+    },
+    'spline_slopes': {
+        'signature':
+            '(const realtype *p, const realtype *k)',
+        'flags': ['dont_generate_body']
+    },
+    'dspline_valuesdp': {
+        'signature':
+            '(realtype *dspline_valuesdp, const realtype *p, const realtype *k)'
+    },
+    'dspline_slopesdp': {
+        'signature':
+            '(realtype *dspline_slopesdp, const realtype *p, const realtype *k)'
     },
     'dwdw': {
         'signature':
@@ -153,7 +188,8 @@ functions = {
         'signature':
             '(realtype *w, const realtype t, const realtype *x, '
             'const realtype *p, const realtype *k, '
-            'const realtype *h, const realtype *tcl)',
+            'const realtype *h, const realtype *tcl, '
+            'const realtype *spl)',
         'flags': ['assume_pow_positivity']
     },
     'x0': {
@@ -691,6 +727,80 @@ def smart_is_zero_matrix(x: Union[sp.MutableDenseMatrix,
     return not nonzero
 
 
+def _print_with_exception(math: sp.Basic, user_functions=None) -> str:
+    """
+    Generate C++ code for a symbolic expression
+    :param math:
+        symbolic expression
+    :return:
+        C++ code for the specified expression
+    """
+    # get list of custom replacements
+    if user_functions is None:
+        user_functions = {}
+    for fun in CUSTOM_FUNCTIONS:
+        user_functions[fun['sympy']] = fun['c++']
+
+    try:
+        ret = cxxcode(math, standard='c++11', user_functions=user_functions)
+        ret = re.sub(r'(^|\W)M_PI(\W|$)', r'\1amici::pi\2', ret)
+        return ret
+    except TypeError as e:
+        raise ValueError(
+            f'Encountered unsupported function in expression "{math}": '
+            f'{e}!'
+        )
+
+
+def _get_sym_lines_array(equations: sp.Matrix,
+                         variable: str,
+                         indent_level: int,
+                         user_functions=None) -> List[str]:
+    """
+    Generate C++ code for assigning symbolic terms in symbols to C++ array
+    `variable`.
+    :param equations:
+        vectors of symbolic expressions
+    :param variable:
+        name of the C++ array to assign to
+    :param indent_level:
+        indentation level (number of leading blanks)
+    :return:
+        C++ code as list of lines
+    """
+
+    return [' ' * indent_level + f'{variable}[{index}] = '
+                                 f'{_print_with_exception(math, user_functions)};'
+            for index, math in enumerate(equations)
+            if not (math == 0 or math == 0.0)]
+
+
+def _get_sym_lines_symbols(symbols: sp.Matrix,
+                           equations: sp.Matrix,
+                           variable: str,
+                           indent_level: int,
+                           user_functions=None) -> List[str]:
+    """
+    Generate C++ code for where array elements are directly replaced with
+    their corresponding macro symbol
+    :param symbols:
+        vectors of symbols that equations are assigned to
+    :param equations:
+        vectors of expressions
+    :param variable:
+        name of the C++ array to assign to, only used in comments
+    :param indent_level:
+        indentation level (number of leading blanks)
+    :return:
+        C++ code as list of lines
+    """
+
+    return [' ' * indent_level + f'{sym} = {_print_with_exception(math, user_functions)};' \
+                                 f'  // {variable}[{index}]'
+            for index, (sym, math) in enumerate(zip(symbols, equations))
+            if not (math == 0 or math == 0.0)]
+
+
 class ODEModel:
     """
     Defines an Ordinary Differential Equation as set of ModelQuantities.
@@ -881,12 +991,35 @@ class ODEModel:
             imported SBML model
         """
 
+        # HACK remove real=True assumptions from spline symbols
+        #   must be done as the first thing because it modifies the SbmlImporter
+        for spl in si.splines:
+            old_sbmlId = spl.sbmlId
+            new_sbmlId = sp.Symbol(spl.sbmlId.name)
+            si._replace_in_all_expressions(old_sbmlId, new_sbmlId)
+
         # get symbolic expression from SBML importers
         symbols = copy.copy(si.symbols)
+
+        # add splines as expressions to the model
+        spline_subs = {}  # saved for later substituting into the fluxes
+        for spl in si.splines:
+            spline_expr = spl.odeModelSymbol(si)
+            spline_subs[spl.sbmlId] = spline_expr
+            self.add_component(Expression(
+                identifier=spl.sbmlId,
+                name=str(spl.sbmlId),
+                value=spline_expr
+            ))
+        nspl = len(si.splines)
+        self.splines = si.splines
 
         # assemble fluxes and add them as expressions to the model
         fluxes = []
         for ir, flux in enumerate(si.flux_vector):
+            # replace splines inside fluxes
+            flux = flux.subs(spline_subs)
+            # add flux to expressions
             flux_id = sp.Symbol(f'flux_r{ir}', real=True)
             self.add_component(Expression(
                 identifier=flux_id,
@@ -994,12 +1127,13 @@ class ODEModel:
         # expressions, but conservation law expressions are inserted before
         # flux expressions. If this ordering is to be changed, the following
         # code will have to be adapted.
-        ncl = nw - nr
-        self._eqs['dxdotdw'] = sp.zeros(nx_solver, ncl).row_join(
-            si.stoichiometric_matrix
-        )
-        for ix, iw, val in dxdotdw_updates:
-            self._eqs['dxdotdw'][ix, ncl + iw] = val
+        if nspl == 0:
+            ncl = nw - nr
+            self._eqs['dxdotdw'] = sp.zeros(nx_solver, ncl).row_join(
+                si.stoichiometric_matrix
+            )
+            for ix, iw, val in dxdotdw_updates:
+                self._eqs['dxdotdw'][ix, ncl + iw] = val
 
         # fill in 'self._sym' based on prototypes and components in ode_model
         self.generate_basic_variables(from_sbml=True)
@@ -1384,6 +1518,19 @@ class ODEModel:
             length = self._symboldim_funs[name]()
         elif name in sensi_functions:
             length = self.eq(name).shape[0]
+        elif name == 'spl':
+            # placeholders for the numeric spline values. Need to create symbols
+            self._syms[name] = sp.Matrix([
+                [f'spl_{isp}' for isp in range(len(self.splines))]
+            ])
+            return
+        elif name == 'sspl':
+            # placeholders for spline sensitivities. Need to create symbols
+            self._syms[name] = sp.Matrix([
+                [f'sspl_{isp}_{ip}' for ip in range(len(self._syms['p']))]
+                for isp in range(len(self.splines))
+            ])
+            return
         else:
             length = len(self.eq(name))
 
@@ -1399,6 +1546,9 @@ class ODEModel:
         for var in self._variable_prototype:
             if var not in self._syms:
                 self._generate_symbol(var, from_sbml=from_sbml)
+        # symbols for spline values need to be created in addition
+        for var in ['spl', 'sspl']:
+            self._generate_symbol(var)
 
         self._generate_symbol('x', from_sbml=from_sbml)
 
@@ -1582,6 +1732,14 @@ class ODEModel:
             # force symbols
             self._eqs[name] = self.sym(name)
 
+        elif name == 'spl':
+            # force symbols
+            self._eqs[name] = self.sym(name)
+
+        elif name == 'sspl':
+            # force symbols
+            self._eqs[name] = self.sym(name)
+
         elif name == 'dxdotdx_explicit':
             # force symbols
             self._derivative('xdot', 'x', name=name)
@@ -1589,6 +1747,24 @@ class ODEModel:
         elif name == 'dxdotdp_explicit':
             # force symbols
             self._derivative('xdot', 'p', name=name)
+
+        elif name == 'spline_values':
+            # force symbols
+            self._eqs[name] = sp.Matrix([
+                yy for spline in self.splines
+                for yy in spline.yy
+            ])
+
+        elif name == 'spline_slopes':
+            # force symbols
+            self._eqs[name] = sp.Matrix([
+                dd for spline in self.splines
+                for dd in (
+                    sp.zeros(len(spline.dd), 1)
+                    if spline.derivatives_by_fd
+                    else spline.dd
+                )
+            ])
 
         elif match_deriv:
             self._derivative(match_deriv.group(1), match_deriv.group(2))
@@ -1967,88 +2143,6 @@ class ODEModel:
         return n_species > 1
 
 
-def _print_with_exception(math: sp.Basic) -> str:
-    """
-    Generate C++ code for a symbolic expression
-
-    :param math:
-        symbolic expression
-
-    :return:
-        C++ code for the specified expression
-    """
-    # get list of custom replacements
-    user_functions = {fun['sympy']: fun['c++'] for fun in CUSTOM_FUNCTIONS}
-
-    try:
-        ret = cxxcode(math, standard='c++11', user_functions=user_functions)
-        ret = re.sub(r'(^|\W)M_PI(\W|$)', r'\1amici::pi\2', ret)
-        return ret
-    except TypeError as e:
-        raise ValueError(
-            f'Encountered unsupported function in expression "{math}": '
-            f'{e}!'
-        )
-
-
-def _get_sym_lines_array(equations: sp.Matrix,
-                         variable: str,
-                         indent_level: int) -> List[str]:
-    """
-    Generate C++ code for assigning symbolic terms in symbols to C++ array
-    `variable`.
-
-    :param equations:
-        vectors of symbolic expressions
-
-    :param variable:
-        name of the C++ array to assign to
-
-    :param indent_level:
-        indentation level (number of leading blanks)
-
-    :return:
-        C++ code as list of lines
-
-    """
-
-    return [' ' * indent_level + f'{variable}[{index}] = '
-                                 f'{_print_with_exception(math)};'
-            for index, math in enumerate(equations)
-            if not (math == 0 or math == 0.0)]
-
-
-def _get_sym_lines_symbols(symbols: sp.Matrix,
-                           equations: sp.Matrix,
-                           variable: str,
-                           indent_level: int) -> List[str]:
-    """
-    Generate C++ code for where array elements are directly replaced with
-    their corresponding macro symbol
-
-    :param symbols:
-        vectors of symbols that equations are assigned to
-
-    :param equations:
-        vectors of expressions
-
-    :param variable:
-        name of the C++ array to assign to, only used in comments
-
-    :param indent_level:
-        indentation level (number of leading blanks)
-
-    :return:
-        C++ code as list of lines
-
-    """
-
-    return [' ' * indent_level + f'{sym} = {_print_with_exception(math)};' \
-                                 f'  // {variable}[{index}]'
-            for index, (sym, math) in enumerate(zip(symbols, equations))
-            if not (math == 0 or math == 0.0)]
-
-
 class ODEExporter:
     """
     The ODEExporter class generates AMICI C++ files for ODE model as
@@ -2193,6 +2287,8 @@ class ODEExporter:
             if function in sparse_functions:
                 self._write_function_index(function, 'colptrs')
                 self._write_function_index(function, 'rowvals')
+            if function == 'spline_constructors':
+                self._write_function_file(function)
 
         for name in self.model.sym_names():
             self._write_index_files(name)
@@ -2297,6 +2393,29 @@ class ODEExporter:
         with open(compile_script, 'w') as fileout:
             fileout.write('\n'.join(lines))
 
+    def _get_index(self, name: str) -> Dict[sp.Symbol, int]:
+        """
+        Compute indices for a symbolic array.
+
+        :param name:
+            key in self.model._syms for which to obtain the index.
+
+        :return:
+            a dictionary of symbol/index pairs.
+        """
+        if name in self.model.sym_names():
+            if name in sparse_functions:
+                symbols = self.model.sparsesym(name)
+            else:
+                symbols = self.model.sym(name).T
+        else:
+            raise ValueError(f'Unknown symbolic array: {name}')
+
+        return {
+            strip_pysb(symbol).name : index
+            for index, symbol in enumerate(symbols)
+        }
+
     def _write_index_files(self, name: str) -> None:
         """
         Write index file for a symbolic array.
@@ -2346,6 +2465,8 @@ class ODEExporter:
                 and function == 'sx0_fixedParameters':
             # Not required. Will create empty function body.
             equations = sp.Matrix()
+        elif function == 'spline_constructors':
+            pass
         else:
             equations = self.model.eq(function)
 
@@ -2355,6 +2476,9 @@ class ODEExporter:
             '#include "amici/defines.h"',
             '#include "sundials/sundials_types.h"',
         ]
+        if function == 'spline_constructors':
+            lines += ['#include "amici/splinefunctions.h"',
+                      '#include <vector>']
 
         # function signature
         signature = self.functions[function]['signature']
@@ -2376,10 +2500,16 @@ class ODEExporter:
             '',
         ])
 
-        lines.append(f'void {function}_{self.model_name}{signature}{{')
+        if function == 'spline_constructors':
+            lines.append(f'std::vector<HermiteSpline> {function}_{self.model_name}{signature}{{')
+        else:
+            lines.append(f'void {function}_{self.model_name}{signature}{{')
 
         # function body
-        body = self._get_function_body(function, equations)
+        if function == 'spline_constructors':
+            body = self._get_spline_constructors_body()
+        else:
+            body = self._get_function_body(function, equations)
         if self.assume_pow_positivity and 'assume_pow_positivity' \
                 in self.functions[function].get('flags', []):
             body = [re.sub(r'(^|\W)pow\(', r'\1amici::pos_pow(', line)
@@ -2533,8 +2663,10 @@ class ODEExporter:
                         self.model._x0_fixedParameters_idx,
                         equations[:, ipar]
                 ):
-                    expressions.append(f'{function}[{index}] = '
-                                       f'{_print_with_exception(formula)};')
+                    expressions.append(
+                        f'{function}[{index}] = '
+                        f'{_print_with_exception(formula, self._user_functions())};'
+                    )
                 cases[ipar] = expressions
             lines.extend(get_switch_statement('ip', cases, 1))
 
@@ -2543,12 +2675,14 @@ class ODEExporter:
                     self.model._x0_fixedParameters_idx,
                     equations
             ):
-                lines.append(f'{function}[{index}] = '
-                             f'{_print_with_exception(formula)};')
+                lines.append(
+                    f'{function}[{index}] = '
+                    f'{_print_with_exception(formula, self._user_functions())};'
+                )
 
         elif function in sensi_functions:
             cases = {ipar: _get_sym_lines_array(equations[:, ipar], function,
-                                                0)
+                                                0, self._user_functions())
                      for ipar in range(self.model.num_par())
                      if not smart_is_zero_matrix(equations[:, ipar])}
             lines.extend(get_switch_statement('ip', cases, 1))
@@ -2556,12 +2690,12 @@ class ODEExporter:
         elif function in multiobs_functions:
             if function == 'dJydy':
                 cases = {iobs: _get_sym_lines_array(equations[iobs], function,
-                                                    0)
+                                                    0, self._user_functions())
                          for iobs in range(self.model.num_obs())
                          if not smart_is_zero_matrix(equations[iobs])}
             else:
                 cases = {iobs: _get_sym_lines_array(equations[:, iobs], function,
-                                                    0)
+                                                    0, self._user_functions())
                          for iobs in range(self.model.num_obs())
                          if not smart_is_zero_matrix(equations[:, iobs])}
             lines.extend(get_switch_statement('iy', cases, 1))
@@ -2572,12 +2706,89 @@ class ODEExporter:
                 symbols = self.model.sparsesym(function)
             else:
                 symbols = self.model.sym(function, stripped=True)
-            lines += _get_sym_lines_symbols(symbols, equations, function, 4)
+            lines += _get_sym_lines_symbols(symbols, equations, function, 4, self._user_functions())
 
         else:
-            lines += _get_sym_lines_array(equations, function, 4)
+            lines += _get_sym_lines_array(equations, function, 4, self._user_functions())
 
         return [line for line in lines if line]
+
+    def _get_spline_constructors_body(self):
+        body = [f'\tstd::vector<HermiteSpline> splines;', '']
+        for ispl, spline in enumerate(self.model.splines):
+            # create the vector with the node locations
+            nodes = f'\tstd::vector<realtype> nodes{ispl} {{'
+            if isinstance(spline.xx, UniformGrid):
+                nodes += str(spline.xx.start) + ', ' + str(spline.xx.stop) + '};'
+            else:
+                nodes += ', '.join(str(x) for x in spline.xx) + '};'
+            body.append(nodes)
+
+            # create the vector with the node values
+            vals = f'\tstd::vector<realtype> values{ispl} {{' + str(spline.yy[0])
+            for iyy in spline.yy[1:]:
+                vals += ', ' + str(iyy)
+            vals += '};'
+            body.append(vals)
+
+            # create the vector with the slopes
+            body.append(f'\tstd::vector<realtype> slopes{ispl};')
+            constr = f'\tHermiteSpline spline{ispl} = HermiteSpline('
+            constr += f'nodes{ispl}, values{ispl}, slopes{ispl}, '
+
+            for bc in spline.bc:
+                if bc is None:
+                    constr += 'SplineBoundaryCondition::given, '
+                elif bc == 'zeroderivative':
+                    constr += 'SplineBoundaryCondition::zeroDerivative, '
+                elif bc == 'natural':
+                    constr += 'SplineBoundaryCondition::natural, '
+                elif bc == 'zeroderivative+natural':
+                    constr += 'SplineBoundaryCondition::naturalZeroDerivative, '
+                elif bc == 'periodic':
+                    constr += 'SplineBoundaryCondition::periodic, '
+                else:
+                    raise ValueError(
+                        f'unknown bc {bc} found in spline object'
+                    )
+
+            for extr in spline.extrapolate:
+                if extr is None:
+                    constr += 'SplineExtrapolation::noExtrapolation, '
+                elif extr == 'polynomial':
+                    constr += 'SplineExtrapolation::polynomial, '
+                elif extr == 'constant':
+                    constr += 'SplineExtrapolation::constant, '
+                elif extr == 'linear':
+                    constr += 'SplineExtrapolation::linear, '
+                elif extr == 'periodic':
+                    constr += 'SplineExtrapolation::periodic, '
+                else:
+                    raise ValueError(
+                        f'unknown extrapolation {extr} found in spline object'
+                    )
+
+            if spline.derivatives_by_fd:
+                constr += 'true, '
+            else:
+                constr += 'false, '
+
+            if isinstance(spline.xx, UniformGrid):
+                constr += 'true, '
+            else:
+                constr += 'false, '
+
+            if spline.logarithmic_paraterization:
+                constr += 'true);'
+            else:
+                constr += 'false);'
+
+            body.append(constr)
+            body.append(f'\tsplines.push_back(spline{ispl});')
+            body.append('')
+
+        body.append('return splines;')
+        return body
 
     def _write_wrapfunctions_cpp(self) -> None:
         """
@@ -2834,6 +3045,15 @@ class ODEExporter:
                 "digits and underscores, and must not start with a digit.")
 
         self.model_name = model_name
+
+    def _user_functions(self):
+        """
+        Get user functions for conversion from SymPy to C++.
+        """
+        return spline_user_functions(
+            self.model.splines,
+            self._get_index('p')
+        )
 
 
 class TemplateAmici(Template):

@@ -5,6 +5,7 @@
 #include "amici/defines.h"
 #include "amici/sundials_matrix_wrapper.h"
 #include "amici/vector.h"
+#include "amici/splinefunctions.h"
 
 #include <map>
 #include <memory>
@@ -210,7 +211,7 @@ class Model : public AbstractModel {
     using AbstractModel::fx0_fixedParameters;
     using AbstractModel::fy;
     using AbstractModel::fz;
-    
+
     /**
      * @brief Initialize model properties.
      * @param x Reference to state variables
@@ -247,6 +248,13 @@ class Model : public AbstractModel {
     void initializeStateSensitivities(AmiVectorArray &sx, const AmiVector &x);
 
     /**
+     * @brief Initialization of spline functions
+     */
+     void initializeSplines();
+
+     void initializeSplineSensitivities();
+
+     /**
      * @brief Initialize the Heaviside variables `h` at the initial time `t0`.
      *
      * Heaviside variables activate/deactivate on event occurrences.
@@ -1260,6 +1268,9 @@ class Model : public AbstractModel {
     /** Number of solver states subject to reinitialization */
     int nx_solver_reinit{0};
 
+    /** numer of spline functions in the model */
+    int nspl = 0;
+
     /** Number of observables */
     int ny{0};
 
@@ -1292,13 +1303,13 @@ class Model : public AbstractModel {
 
     /** Flag indicating Matlab- or Python-based model generation */
     bool pythonGenerated;
-    
+
     /**
      * @brief getter for dxdotdp (matlab generated)
      * @return dxdotdp
      */
     const AmiVectorArray &get_dxdotdp() const;
-    
+
     /**
      * @brief getter for dxdotdp (python generated)
      * @return dxdotdp
@@ -1617,6 +1628,18 @@ class Model : public AbstractModel {
                      const AmiVector &x, const ExpData &edata);
 
     /**
+     * @brief Spline functions
+     * @param t timepoint
+     */
+    void fspl(realtype t);
+
+    /**
+     * @brief Parametric derivatives of splines functions
+     * @param t timepoint
+     */
+    void fsspl(realtype t);
+
+    /**
      * @brief Compute recurring terms in xdot.
      * @param t Timepoint
      * @param x Array with the states
@@ -1636,7 +1659,7 @@ class Model : public AbstractModel {
      * @param x Array with the states
      */
     void fdwdx(realtype t, const realtype *x);
-    
+
     /**
      * @brief Compute self derivative for recurring terms in xdot.
      * @param t Timepoint
@@ -1746,13 +1769,13 @@ class Model : public AbstractModel {
 
     /** Sparse dwdx temporary storage (dimension: `ndwdx`) */
     mutable SUNMatrixWrapper dwdx_;
-    
+
     /** Sparse dwdp temporary storage (dimension: `ndwdp`) */
     mutable SUNMatrixWrapper dwdp_;
-    
+
     /** Dense Mass matrix (dimension: `nx_solver` x `nx_solver`) */
     mutable SUNMatrixWrapper M_;
-    
+
     /**
      * Temporary storage of `dxdotdp_full` data across functions (Python only)
      * (dimension: `nplist` x `nx_solver`, nnz: dynamic,
@@ -1774,7 +1797,7 @@ class Model : public AbstractModel {
      * type `CSC_MAT`)
      */
     mutable SUNMatrixWrapper dxdotdp_implicit;
-    
+
     /**
      * Temporary storage of `dxdotdx_explicit` data across functions (Python only)
      * (dimension: `nplist` x `nx_solver`, nnz: 'nxdotdotdx_explicit',
@@ -1902,6 +1925,15 @@ class Model : public AbstractModel {
     /** temporary storage for sx_rdata slice (dimension: nx_rdata) */
     mutable std::vector<realtype> sx_rdata_;
 
+    /** temporary storage for splines */
+    mutable std::vector<realtype> spl_;
+
+    /** temporary storage for sensitivities of splines */
+    mutable SUNMatrixWrapper sspl_;
+
+    /** temporary storage for splines in the model */
+    mutable std::vector<HermiteSpline> splines_;
+
     /** temporary storage for time-resolved observable (dimension: ny) */
     mutable std::vector<realtype> y_;
 
@@ -1999,10 +2031,10 @@ class Model : public AbstractModel {
 
     /** Sparse dwdw temporary storage (dimension: `ndwdw`) */
     mutable SUNMatrixWrapper dwdw_;
-    
+
     /** Sparse dwdx implicit temporary storage (dimension: `ndwdx`) */
     mutable std::vector<SUNMatrixWrapper> dwdx_hierarchical_;
-    
+
     /** Recursion */
     int w_recursion_depth_ {0};
 };

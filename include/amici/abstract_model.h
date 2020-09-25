@@ -4,6 +4,7 @@
 #include "amici/defines.h"
 #include "amici/sundials_matrix_wrapper.h"
 #include "amici/vector.h"
+#include "amici/splinefunctions.h"
 
 #include <sunmatrix/sunmatrix_band.h>
 #include <sunmatrix/sunmatrix_dense.h>
@@ -626,7 +627,7 @@ class AbstractModel {
     virtual void fdJydy(realtype *dJydy, int iy, const realtype *p,
                         const realtype *k, const realtype *y,
                         const realtype *sigmay, const realtype *my);
-                        
+
     /**
      * @brief Model-specific implementation of fdJydy colptrs
      * @param dJydy sparse matrix to which colptrs will be written
@@ -722,10 +723,11 @@ class AbstractModel {
      * @param k constants vector
      * @param h Heaviside vector
      * @param tcl total abundances for conservation laws
+     * @param spl spline value vector
      */
     virtual void fw(realtype *w, const realtype t, const realtype *x,
                     const realtype *p, const realtype *k, const realtype *h,
-                    const realtype *tcl);
+                    const realtype *tcl, const realtype *spl);
 
     /**
      * @brief Model specific sparse implementation of dwdp
@@ -738,11 +740,14 @@ class AbstractModel {
      * @param w vector with helper variables
      * @param tcl total abundances for conservation laws
      * @param stcl sensitivities of total abundances for conservation laws
+     * @param spl spline value vector
+     * @param sspl sensitivities of spline values vector
      */
     virtual void fdwdp(realtype *dwdp, const realtype t, const realtype *x,
                        const realtype *p, const realtype *k, const realtype *h,
                        const realtype *w, const realtype *tcl,
-                       const realtype *stcl);
+                       const realtype *stcl, const realtype *spl,
+                       const realtype *sspl);
 
     /**
      * @brief Model specific implementation for dwdp, column pointers
@@ -772,7 +777,8 @@ class AbstractModel {
     virtual void fdwdp(realtype *dwdp, const realtype t, const realtype *x,
                        const realtype *p, const realtype *k, const realtype *h,
                        const realtype *w, const realtype *tcl,
-                       const realtype *stcl, int ip);
+                       const realtype *stcl, const realtype *spl,
+                       const realtype *sspl, int ip);
 
     /**
      * @brief Model specific implementation of dwdx, data part
@@ -784,10 +790,12 @@ class AbstractModel {
      * @param h Heaviside vector
      * @param w vector with helper variables
      * @param tcl total abundances for conservation laws
+     * @param spl spline value vector
      */
     virtual void fdwdx(realtype *dwdx, const realtype t, const realtype *x,
                        const realtype *p, const realtype *k, const realtype *h,
-                       const realtype *w, const realtype *tcl);
+                       const realtype *w, const realtype *tcl,
+                       const realtype *spl);
 
     /**
      * @brief Model specific implementation for dwdx, column pointers
@@ -800,7 +808,7 @@ class AbstractModel {
      * @param dwdx sparse matrix to which rowvals will be written
      */
     virtual void fdwdx_rowvals(SUNMatrixWrapper &dwdx);
-    
+
     /**
      * @brief Model specific implementation of fdwdw, no w chainrule (Py)
      * @param dwdw partial derivative w wrt w
@@ -827,6 +835,15 @@ class AbstractModel {
      * @param dwdw sparse matrix to which rowvals will be written
      */
     virtual void fdwdw_rowvals(SUNMatrixWrapper &dwdw);
+
+    virtual std::vector<HermiteSpline> fspline_constructors(const realtype *p,
+                                                            const realtype *k);
+
+    virtual void fdspline_valuesdp(realtype *dspline_valuesdp,
+                                   const realtype *p, const realtype *k);
+
+    virtual void fdspline_slopesdp(realtype *dspline_slopesdp,
+                                   const realtype *p, const realtype *k);
 };
 
 } // namespace amici

@@ -10,22 +10,23 @@ import sympy as sp
 import libsbml as sbml
 import re
 import math
-import itertools as itt
 import warnings
 import logging
+import xml.etree.ElementTree as ET
 from typing import Dict, Union, List, Callable, Any, Iterable
 
 from .ode_export import ODEExporter, ODEModel, get_measurement_symbol
 from .ode_export import logger as oe_logger
 from .logging import get_logger, log_execution_time, set_log_level
+from .sbml_utils import (
+    setSbmlMath,
+    annotation_namespace,
+    _check_unsupported_functions,
+    _parse_special_functions,
+    _parse_logical_operators,
+)
+from .splines import AbstractSpline
 from . import has_clibs
-
-from sympy.logic.boolalg import BooleanTrue as spTrue
-from sympy.logic.boolalg import BooleanFalse as spFalse
-from sympy.printing.mathml import MathMLContentPrinter
-
-# the following import can be removed if sympy PR #19958 is merged
-from mpmath.libmp import repr_dps, to_str as mlib_to_str
 
 
 class SBMLException(Exception):
@@ -116,7 +117,8 @@ class SbmlImporter:
     def __init__(self,
                  sbml_source: Union[str, sbml.Model],
                  show_sbml_warnings: bool = False,
-                 from_file: bool = True) -> None:
+                 from_file: bool = True,
+                 discard_annotations: bool = False) -> None:
         """
         Create a new Model instance.
 
@@ -131,6 +133,9 @@ class SbmlImporter:
         :param from_file:
             Whether `sbml_source` is a file name (True, default), or an SBML
             string
+
+        :param discard_annotations:
+            discard information contained in AMICI SBML annotations (debug).
         """
         if isinstance(sbml_source, sbml.Model):
             self.sbml_doc: sbml.Document = sbml_source.getSBMLDocument()
@@ -159,6 +164,8 @@ class SbmlImporter:
         self.species_rate_rules: dict = {}
         self.compartment_assignment_rules: dict = {}
         self.species_assignment_rules: dict = {}
+
+        self._discard_annotations : bool = discard_annotations
 
     def _process_document(self) -> None:
         """
@@ -355,6 +362,8 @@ class SbmlImporter:
         if constant_parameters is None:
             constant_parameters = []
 
+        if not self._discard_annotations:
+            self._process_annotations()
         self.check_support()
         self._gather_locals()
         self._process_parameters(constant_parameters)
@@ -772,6 +781,25 @@ class SbmlImporter:
                             'libsbml.SBML_COMPARTMENT and '
                             'libsbml.SBML_SPECIES components.')
 
+    @log_execution_time('processing SBML annotations', logger)
+    def _process_annotations(self) -> None:
+        # Remove all parameters (and corresponding rules)
+        # for which amici:discard is set
+        parameter_ids_to_remove = []
+        for p in self.sbml.getListOfParameters():
+            annotation = p.getAnnotationString()
+            assert isinstance(annotation, str)
+            if len(annotation) != 0:
+                annotation = ET.fromstring(annotation)
+                for child in annotation.getchildren():
+                    if child.tag == f'{{{annotation_namespace}}}discard':
+                        parameter_ids_to_remove.append(p.getIdAttribute())
+        for pId in parameter_ids_to_remove:
+            # Remove corresponding rules
+            self.sbml.removeRuleByVariable(pId)
+            # Remove parameter
+            self.sbml.removeParameter(pId)
+
     @log_execution_time('processing SBML parameters', logger)
     def _process_parameters(self,
                             constant_parameters: List[str] = None) -> None:
@@ -993,15 +1021,42 @@ class SbmlImporter:
 
         assignments = {}
 
+        assert not hasattr(self, 'splines')
+        self.splines = []
+
         for rule in rules:
+            # Check whether this rule is a spline rule.
+            if rule.getTypeCode() == sbml.SBML_ASSIGNMENT_RULE:
+                if not self._discard_annotations:
+                    annotation = AbstractSpline.getAnnotation(rule)
+                    if annotation is not None:
+                        variable = sp.sympify(
+                            rule.getVariable(),
+                            locals=self.local_symbols
+                        )
+                        if variable not in parametervars:
+                            raise NotImplementedError(
+                                "Spline AssignmentRules are only supported for "
+                                "SBML parameters at the moment."
+                            )
+                        self.splines.append(
+                            AbstractSpline.fromAnnotation(
+                                variable, annotation, locals=self.local_symbols
+                            )
+                        )
+                        continue
+
             # Rate rules should not be substituted for the target of the rate
             # rule.
-            if rule.getTypeCode() == sbml.SBML_RATE_RULE:
+            elif rule.getTypeCode() == sbml.SBML_RATE_RULE:
                 continue
+
             if rule.getFormula() == '':
                 continue
+
             variable = sp.sympify(rule.getVariable(),
                                   locals=self.local_symbols)
+
             # avoid incorrect parsing of pow(x, -1) in symengine
             formula = sp.sympify(_parse_logical_operators(
                 sbml.formulaToL3String(rule.getMath())),
@@ -1058,18 +1113,7 @@ class SbmlImporter:
                         locals=self.local_symbols).subs(variable, formula)
                     nested_formula = _parse_special_functions(nested_formula)
                     _check_unsupported_functions(nested_formula, 'Rule')
-
-                    nested_rule_math_ml = mathml(nested_formula)
-                    nested_rule_math_ml_ast_node = sbml.readMathMLFromString(nested_rule_math_ml)
-
-                    if nested_rule_math_ml_ast_node is None:
-                        raise SBMLException(f'Formula {sbml.formulaToL3String(nested_rule.getMath())}'
-                                            f' cannot be correctly read by SymPy'
-                                            f' or cannot be converted to valid MathML by SymPy!')
-
-                    elif nested_rule.setMath(nested_rule_math_ml_ast_node) != sbml.LIBSBML_OPERATION_SUCCESS:
-                        raise SBMLException(f'Formula {sbml.formulaToL3String(nested_rule.getMath())}'
-                                            f' cannot be parsed by libSBML!')
+                    setSbmlMath(nested_rule, nested_formula)
 
                 for assignment in assignments:
                     assignments[assignment] = assignments[assignment].subs(variable, formula)
@@ -1081,6 +1125,15 @@ class SbmlImporter:
                 sp.Symbol(variable, real=True),
                 assignments[variable]
             )
+
+        # Now formulas inside spline objects have been fully expanded
+        # and we can determine which parameters each spline depends on
+        # It is time to substitute splines with derivable symbolic expressions
+        # for spline in self.splines:
+        #     self._replace_in_all_expressions(
+        #         spline.sbmlId,
+        #         spline.odeModelSymbol(self)
+        #     )
 
     def _process_volume_conversion(self) -> None:
         """
@@ -1499,6 +1552,10 @@ class SbmlImporter:
                 self.compartment_volume[index] = \
                     self.compartment_volume[index].subs(old, new)
 
+        # Substitute inside spline definitions
+        for spline in self.splines:
+            spline._replace_in_all_expressions(old, new)
+
     def _clean_reserved_symbols(self) -> None:
         """
         Remove all reserved symbols from self.symbols
@@ -1697,134 +1754,6 @@ def _check_lib_sbml_errors(sbml_doc: sbml.SBMLDocument,
         )
 
 
-def _check_unsupported_functions(sym: sp.Basic,
-                                 expression_type: str,
-                                 full_sym: sp.Basic = None):
-    """
-    Recursively checks the symbolic expression for unsupported symbolic
-    functions
-
-    :param sym:
-        symbolic expressions
-
-    :param expression_type:
-        type of expression, only used when throwing errors
-    """
-    if full_sym is None:
-        full_sym = sym
-
-    unsupported_functions = [
-        sp.functions.factorial, sp.functions.ceiling, sp.functions.floor,
-        sp.function.UndefinedFunction
-    ]
-
-    unsupp_fun_type = next(
-        (
-            fun_type
-            for fun_type in unsupported_functions
-            if isinstance(sym.func, fun_type)
-        ),
-        None
-    )
-    if unsupp_fun_type:
-        raise SBMLException(f'Encountered unsupported expression '
-                            f'"{sym.func}" of type '
-                            f'"{unsupp_fun_type}" as part of a '
-                            f'{expression_type}: "{full_sym}"!')
-    for fun in list(sym._args) + [sym]:
-        unsupp_fun_type = next(
-            (
-                fun_type
-                for fun_type in unsupported_functions
-                if isinstance(fun, fun_type)
-            ),
-            None
-        )
-        if unsupp_fun_type:
-            raise SBMLException(f'Encountered unsupported expression '
-                                f'"{fun}" of type '
-                                f'"{unsupp_fun_type}" as part of a '
-                                f'{expression_type}: "{full_sym}"!')
-        if fun is not sym:
-            _check_unsupported_functions(fun, expression_type)
-
-
-def _parse_special_functions(sym: sp.Basic, toplevel: bool = True) -> sp.Basic:
-    """
-    Recursively checks the symbolic expression for functions which have be
-    to parsed in a special way, such as piecewise functions
-
-    :param sym:
-        symbolic expressions
-
-    :param toplevel:
-        as this is called recursively, are we in the top level expression?
-    """
-    args = tuple(_parse_special_functions(arg, False) for arg in sym._args)
-
-    if sym.__class__.__name__ == 'abs':
-        return sp.Abs(sym._args[0])
-    elif sym.__class__.__name__ == 'xor':
-        return sp.Xor(*sym.args)
-    elif sym.__class__.__name__ == 'piecewise':
-        # how many condition-expression pairs will we have?
-        return sp.Piecewise(*grouper(args, 2, True))
-    elif isinstance(sym, (sp.Function, sp.Mul, sp.Add)):
-        sym._args = args
-    elif toplevel:
-        # Replace boolean constants by numbers so they can be differentiated
-        #  must not replace in Piecewise function. Therefore, we only replace
-        #  it the complete expression consists only of a Boolean value.
-        if isinstance(sym, spTrue):
-            sym = sp.Float(1.0)
-        elif isinstance(sym, spFalse):
-            sym = sp.Float(0.0)
-
-    return sym
-
-
-def _parse_logical_operators(math_str: str) -> Union[str, None]:
-    """
-    Parses a math string in order to replace logical operators by a form
-    parsable for sympy
-
-    :param math_str:
-        str with mathematical expression
-    :param math_str:
-        parsed math_str
-    """
-    if math_str is None:
-        return None
-
-    if ' xor(' in math_str or ' Xor(' in math_str:
-        raise SBMLException('Xor is currently not supported as logical '
-                            'operation.')
-
-    return (math_str.replace('&&', '&')).replace('||', '|')
-
-
-def grouper(iterable: Iterable, n: int,
-            fillvalue: Any = None) -> Iterable[Iterable]:
-    """
-    Collect data into fixed-length chunks or blocks
-
-    grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx"
-
-    :param iterable:
-        any iterable
-
-    :param n:
-        chunk length
-
-    :param fillvalue:
-        padding for last chunk if length < n
-
-    :return: itertools.zip_longest of requested chunks
-    """
-    args = [iter(iterable)] * n
-    return itt.zip_longest(*args, fillvalue=fillvalue)
-
-
 def assignmentRules2observables(sbml_model: sbml.Model,
                                 filter_function: Callable = lambda *_: True):
     """
@@ -2018,34 +1947,3 @@ def _get_str_symbol_identifiers(str_symbol: str) -> tuple:
     """Get identifiers for simulation, measurement, and sigma."""
     y, m, sigma = f"{str_symbol}", f"m{str_symbol}", f"sigma{str_symbol}"
     return y, m, sigma
-
-
-class MathMLSbmlPrinter(MathMLContentPrinter):
-    """Prints a SymPy expression to a MathML expression parsable by libSBML.
-
-    Differences from :class:`sympy.MathMLContentPrinter`:
-
-    1. underscores in symbol names are not converted to subscripts
-    2. symbols with name 'time' are converted to the SBML time symbol
-    """
-    def _print_Symbol(self, sym):
-        ci = self.dom.createElement(self.mathml_tag(sym))
-        ci.appendChild(self.dom.createTextNode(sym.name))
-        return ci
-
-    # _print_Float can be removed if sympy PR #19958 is merged
-    def _print_Float(self, expr):
-        x = self.dom.createElement(self.mathml_tag(expr))
-        repr_expr = mlib_to_str(expr._mpf_, repr_dps(expr._prec))
-        x.appendChild(self.dom.createTextNode(repr_expr))
-        return x
-
-    def doprint(self, expr):
-        mathml = super().doprint(expr)
-        mathml = '<math xmlns="http://www.w3.org/1998/Math/MathML">' + mathml + '</math>'
-        mathml = mathml.replace(f'<ci>time</ci>', '<csymbol encoding="text" definitionURL="http://www.sbml.org/sbml/symbols/time"> time </csymbol>')
-        return mathml
-
-
-def mathml(expr, **settings):
-    return MathMLSbmlPrinter(settings).doprint(expr)
