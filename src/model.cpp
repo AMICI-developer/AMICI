@@ -210,8 +210,11 @@ bool operator==(const ModelDimensions &a, const ModelDimensions &b) {
 void Model::initialize(AmiVector &x, AmiVector &dx, AmiVectorArray &sx,
                        AmiVectorArray & /*sdx*/, bool computeSensitivities) {
     initializeStates(x);
-    if (computeSensitivities)
+    initializeSplines();
+    if (computeSensitivities) {
         initializeStateSensitivities(sx, x);
+        initializeSplineSensitivities();
+    }
 
     fdx0(x, dx);
     if (computeSensitivities)
@@ -239,6 +242,41 @@ void Model::initializeStates(AmiVector &x) {
         std::copy(x0_solver.cbegin(), x0_solver.cend(), x.data());
     }
 }
+
+void Model::initializeSplines() {
+    splines_ = fspline_constructors(state_.unscaledParameters.data(),
+                                    state_.fixedParameters.data());
+    int nspl = splines_.size();
+    state_.spl_.resize(nspl, 0.0);
+    for (int ispl = 0; ispl < nspl; ispl++)
+        splines_[ispl].computeCoefficients();
+}
+
+void Model::initializeSplineSensitivities() {
+    int nspl = splines_.size();
+    int spline_offset = 0;
+    int allnodes = 0;
+
+    derived_state_.sspl_ = SUNMatrixWrapper(nspl, nplist());
+    for (int ispl = 0; ispl < nspl; ispl++)
+        allnodes += splines_[ispl].n_nodes();
+
+    std::vector<realtype> dspline_valuesdp (allnodes * nplist(), 0.0);
+    std::vector<realtype> dspline_slopesdp (allnodes * nplist(), 0.0);
+    fdspline_valuesdp(dspline_valuesdp.data(), state_.unscaledParameters.data(),
+                      state_.fixedParameters.data());
+    fdspline_slopesdp(dspline_slopesdp.data(), state_.unscaledParameters.data(),
+                      state_.fixedParameters.data());
+
+    // QUESTION is it possible for plist != range(nplist) ?
+    //          would that break computeCoefficientsSensi or not?
+    for (int ispl = 0; ispl < nspl; ispl++) {
+        splines_[ispl].computeCoefficientsSensi(nplist(), spline_offset,
+            dspline_valuesdp.data(), dspline_slopesdp.data());
+        spline_offset += splines_[ispl].n_nodes() * nplist();
+    }
+}
+
 
 void Model::initializeStateSensitivities(AmiVectorArray &sx,
                                          AmiVector const &x) {
@@ -798,6 +836,7 @@ void Model::getObservableSensitivity(gsl::span<realtype> sy, const realtype t,
         return;
 
     fdydx(t, x);
+    fsspl(t);
     fdydp(t, x);
 
     derived_state_.sx_.resize(nx_solver * nplist());
@@ -1924,10 +1963,38 @@ void Model::fdJrzdsigma(const int ie, const int nroots, const realtype t,
     }
 }
 
+void Model::fspl(const realtype t) {
+    for (int ispl = 0; ispl < nspl; ispl++) {
+        if (splines_[ispl].get_logarithmic_parametrization()) {
+            state_.spl_[ispl] = std::exp(splines_[ispl].getValue(t));
+        } else {
+            state_.spl_[ispl] = splines_[ispl].getValue(t);
+        }
+    }
+}
+
+void Model::fsspl(const realtype t) {
+    derived_state_.sspl_.zero();
+    realtype *sspl_data = derived_state_.sspl_.data();
+    for (int ip = 0; ip < nplist(); ip++) {
+        for (int ispl = 0; ispl < nspl; ispl++) {
+            if (splines_[ispl].get_logarithmic_parametrization()) {
+                sspl_data[ispl + nspl * ip] =
+                    state_.spl_[ispl] * splines_[ispl].getSensitivity(t, ip);
+            } else {
+                sspl_data[ispl + nspl * ip] =
+                    splines_[ispl].getSensitivity(t, ip);
+            }
+        }
+    }
+}
+
 void Model::fw(const realtype t, const realtype *x) {
     std::fill(derived_state_.w_.begin(), derived_state_.w_.end(), 0.0);
+    fspl(t);
     fw(derived_state_.w_.data(), t, x, state_.unscaledParameters.data(),
-       state_.fixedParameters.data(), state_.h.data(), state_.total_cl.data());
+       state_.fixedParameters.data(), state_.h.data(), state_.total_cl.data(),
+       state_.spl_.data());
 
     if (always_check_finite_) {
         app->checkFinite(derived_state_.w_, "w");
@@ -1943,6 +2010,7 @@ void Model::fdwdp(const realtype t, const realtype *x) {
     if (pythonGenerated) {
         if (!dwdp_hierarchical_.at(0).capacity())
             return;
+        fsspl(t);
         fdwdw(t,x);
         dwdp_hierarchical_.at(0).zero();
         fdwdp_colptrs(dwdp_hierarchical_.at(0));
@@ -1950,7 +2018,8 @@ void Model::fdwdp(const realtype t, const realtype *x) {
         fdwdp(dwdp_hierarchical_.at(0).data(), t, x,
               state_.unscaledParameters.data(), state_.fixedParameters.data(),
               state_.h.data(), derived_state_.w_.data(), state_.total_cl.data(),
-              state_.stotal_cl.data());
+              state_.stotal_cl.data(), state_.spl_.data(),
+              derived_state_.sspl_.data());
 
         for (int irecursion = 1; irecursion <= w_recursion_depth_;
              irecursion++) {
@@ -1966,7 +2035,8 @@ void Model::fdwdp(const realtype t, const realtype *x) {
         fdwdp(derived_state_.dwdp_.data(), t, x,
               state_.unscaledParameters.data(), state_.fixedParameters.data(),
               state_.h.data(), derived_state_.w_.data(),
-              state_.total_cl.data(), state_.stotal_cl.data());
+              state_.total_cl.data(), state_.stotal_cl.data(),
+              state_.spl_.data(), derived_state_.sspl_.data());
     }
 
     if (always_check_finite_) {
@@ -1990,7 +2060,8 @@ void Model::fdwdx(const realtype t, const realtype *x) {
         fdwdx_rowvals(dwdx_hierarchical_.at(0));
         fdwdx(dwdx_hierarchical_.at(0).data(), t, x,
               state_.unscaledParameters.data(), state_.fixedParameters.data(),
-              state_.h.data(), derived_state_.w_.data(), state_.total_cl.data());
+              state_.h.data(), derived_state_.w_.data(), state_.total_cl.data(),
+              state_.spl_.data());
 
         for (int irecursion = 1; irecursion <= w_recursion_depth_;
              irecursion++) {
@@ -2007,7 +2078,7 @@ void Model::fdwdx(const realtype t, const realtype *x) {
               state_.unscaledParameters.data(),
               state_.fixedParameters.data(), state_.h.data(),
               derived_state_.w_.data(),
-              state_.total_cl.data());
+              state_.total_cl.data(), state_.spl_.data());
     }
 
     if (always_check_finite_) {

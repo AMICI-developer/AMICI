@@ -124,6 +124,9 @@ struct ModelDimensions {
     /** Number of event outputs in the unaugmented system */
     int nztrue{0};
 
+    /** numer of spline functions in the model */
+    int nspl{0};
+
     /** Number of events */
     int ne{0};
 

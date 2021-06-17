@@ -514,7 +514,8 @@ AbstractModel::fw(realtype* /*w*/,
                   const realtype* /*p*/,
                   const realtype* /*k*/,
                   const realtype* /*h*/,
-                  const realtype* /*tcl*/)
+                  const realtype* /*tcl*/,
+                  const realtype* /*spl*/)
 {
     throw AmiException("Requested functionality is not supported as %s is "
                        "not implemented for this model!",
@@ -530,7 +531,9 @@ AbstractModel::fdwdp(realtype* /*dwdp*/,
                      const realtype* /*h*/,
                      const realtype* /*w*/,
                      const realtype* /*tcl*/,
-                     const realtype* /*stcl*/)
+                     const realtype* /*stcl*/,
+                     const realtype* /*spl*/,
+                     const realtype* /*sspl*/)
 {
     throw AmiException("Requested functionality is not supported as %s is "
                        "not implemented for this model!",
@@ -563,6 +566,8 @@ AbstractModel::fdwdp(realtype* /*dwdp*/,
                      const realtype* /*w*/,
                      const realtype* /*tcl*/,
                      const realtype* /*stcl*/,
+                     const realtype* /*spl*/,
+                     const realtype* /*sspl*/,
                      const int /*ip*/)
 {
     throw AmiException("Requested functionality is not supported as %s is "
@@ -578,7 +583,8 @@ AbstractModel::fdwdx(realtype* /*dwdx*/,
                      const realtype* /*k*/,
                      const realtype* /*h*/,
                      const realtype* /*w*/,
-                     const realtype* /*tcl*/)
+                     const realtype* /*tcl*/,
+                     const realtype* /*spl*/)
 {
     throw AmiException("Requested functionality is not supported as %s is "
                        "not implemented for this model!",
@@ -625,6 +631,28 @@ void AbstractModel::fdwdw_rowvals(SUNMatrixWrapper &/*dwdw*/) {
     throw AmiException("Requested functionality is not supported as %s "
                        "is not implemented for this model!",
                        __func__);
+}
+
+std::vector<HermiteSpline> 
+AbstractModel::fspline_constructors(const realtype *p,
+                                    const realtype *k) {
+    // no-op default implementation
+}
+
+void 
+AbstractModel::fdspline_valuesdp(realtype *dspline_valuesdp,
+                                 const realtype* /*p*/,
+                                 const realtype* /*k*/)
+{
+    // no-op default implementation
+}
+
+void 
+AbstractModel::fdspline_slopesdp(realtype *dspline_slopesdp,
+                                 const realtype* /*p*/,
+                                 const realtype* /*k*/)
+{
+    // no-op default implementation
 }
 
 } // namespace amici

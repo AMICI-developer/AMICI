@@ -10,9 +10,10 @@ import sympy as sp
 import libsbml as sbml
 import re
 import math
-import itertools as itt
 import warnings
 import logging
+import xml.etree.ElementTree as ET
+import itertools as itt
 import copy
 from typing import (
     Dict, List, Callable, Any, Iterable, Union, Optional, Tuple, Sequence
@@ -29,6 +30,14 @@ from .ode_export import (
 )
 from .constants import SymbolId
 from .logging import get_logger, log_execution_time, set_log_level
+from .sbml_utils import (
+    setSbmlMath,
+    annotation_namespace,
+    _check_unsupported_functions,
+    _parse_special_functions,
+    _parse_logical_operators,
+)
+from .splines import AbstractSpline
 from . import has_clibs
 
 from sympy.logic.boolalg import BooleanAtom
@@ -115,7 +124,8 @@ class SbmlImporter:
     def __init__(self,
                  sbml_source: Union[str, sbml.Model],
                  show_sbml_warnings: bool = False,
-                 from_file: bool = True) -> None:
+                 from_file: bool = True,
+                 discard_annotations: bool = False) -> None:
         """
         Create a new Model instance.
 
@@ -130,6 +140,9 @@ class SbmlImporter:
         :param from_file:
             Whether `sbml_source` is a file name (True, default), or an SBML
             string
+
+        :param discard_annotations:
+            discard information contained in AMICI SBML annotations (debug).
         """
         if isinstance(sbml_source, sbml.Model):
             self.sbml_doc: sbml.Document = sbml_source.getSBMLDocument()
@@ -169,6 +182,8 @@ class SbmlImporter:
             sbml.L3P_COMPARE_BUILTINS_CASE_INSENSITIVE, None,
             sbml.L3P_MODULO_IS_PIECEWISE
         )
+
+        self._discard_annotations : bool = discard_annotations
 
     def _process_document(self) -> None:
         """
@@ -389,6 +404,9 @@ class SbmlImporter:
         :param constant_parameters:
             SBML Ids identifying constant parameters
         """
+
+        if not self._discard_annotations:
+            self._process_annotations()
         self.check_support()
         self._gather_locals()
         self._process_parameters(constant_parameters)
@@ -779,6 +797,25 @@ class SbmlImporter:
                 'dt': d_dt,
             }
 
+    @log_execution_time('processing SBML annotations', logger)
+    def _process_annotations(self) -> None:
+        # Remove all parameters (and corresponding rules)
+        # for which amici:discard is set
+        parameter_ids_to_remove = []
+        for p in self.sbml.getListOfParameters():
+            annotation = p.getAnnotationString()
+            assert isinstance(annotation, str)
+            if len(annotation) != 0:
+                annotation = ET.fromstring(annotation)
+                for child in annotation:
+                    if child.tag == f'{{{annotation_namespace}}}discard':
+                        parameter_ids_to_remove.append(p.getIdAttribute())
+        for pId in parameter_ids_to_remove:
+            # Remove corresponding rules
+            self.sbml.removeRuleByVariable(pId)
+            # Remove parameter
+            self.sbml.removeParameter(pId)
+
     @log_execution_time('processing SBML parameters', logger)
     def _process_parameters(self,
                             constant_parameters: List[str] = None) -> None:
@@ -899,6 +936,8 @@ class SbmlImporter:
         """
         Process Rules defined in the SBML model.
         """
+        assert not hasattr(self, 'splines')
+        self.splines = []
         for rule in self.sbml.getListOfRules():
             # rate rules are processed in _process_species
             if rule.getTypeCode() == sbml.SBML_RATE_RULE:
@@ -906,6 +945,24 @@ class SbmlImporter:
 
             sbml_var = self.sbml.getElementBySId(rule.getVariable())
             sym_id = symbol_with_assumptions(rule.getVariable())
+
+            # Check whether this rule is a spline rule.
+            if not self._discard_annotations:
+                if rule.getTypeCode() == sbml.SBML_ASSIGNMENT_RULE:
+                    annotation = AbstractSpline.getAnnotation(rule)
+                    if annotation is not None:
+                        if sbml_var not in self.sbml.getListOfParameters():
+                            raise NotImplementedError(
+                                "Spline AssignmentRules are only supported for "
+                                "SBML parameters at the moment."
+                            )
+                        self.splines.append(
+                            AbstractSpline.fromAnnotation(
+                                sym_id, annotation, locals=self._local_symbols
+                            )
+                        )
+                        continue
+
             formula = self._sympy_from_sbml_math(rule)
             if formula is None:
                 continue
@@ -1523,6 +1580,10 @@ class SbmlImporter:
                              smart_subs(v, old, self._make_initial(new))
                              for c, v in self.compartments.items()}
 
+        # Substitute inside spline definitions
+        for spline in self.splines:
+            spline._replace_in_all_expressions(old, new)
+
     def _clean_reserved_symbols(self) -> None:
         """
         Remove all reserved symbols from self.symbols
@@ -1560,7 +1621,7 @@ class SbmlImporter:
             )
             ele_name = var_or_math.element_name
         else:
-            math_string = var_or_math
+            math_string = str(var_or_math)
             ele_name = 'string'
         math_string = replace_logx(math_string)
         try:
@@ -1644,7 +1705,8 @@ class SbmlImporter:
             boolean indicating truth of function name
         """
         a = self.sbml.getAssignmentRuleByVariable(element.getId())
-        if a is None or self._sympy_from_sbml_math(a) is None:
+        if a is None or a.getFormula() == '' or \
+                self._sympy_from_sbml_math(a.getFormula()) is None:
             return False
 
         return True
@@ -1697,163 +1759,6 @@ def _check_lib_sbml_errors(sbml_doc: sbml.SBMLDocument,
         raise SBMLException(
             'SBML Document failed to load (see error messages above)'
         )
-
-
-def _check_unsupported_functions(sym: sp.Expr,
-                                 expression_type: str,
-                                 full_sym: Optional[sp.Expr] = None):
-    """
-    Recursively checks the symbolic expression for unsupported symbolic
-    functions
-
-    :param sym:
-        symbolic expressions
-
-    :param expression_type:
-        type of expression, only used when throwing errors
-
-    :param full sym:
-        outermost symbolic expression in recursive checks, only used for errors
-    """
-    if full_sym is None:
-        full_sym = sym
-
-    # note that sp.functions.factorial, sp.functions.ceiling,
-    # sp.functions.floor applied to numbers should be simplified out and
-    # thus pass this test
-    unsupported_functions = (
-        sp.functions.factorial, sp.functions.ceiling, sp.functions.floor,
-        sp.functions.sec, sp.functions.csc, sp.functions.cot,
-        sp.functions.asec, sp.functions.acsc, sp.functions.acot,
-        sp.functions.acsch, sp.functions.acoth,
-        sp.Mod, sp.core.function.UndefinedFunction
-    )
-
-    if isinstance(sym.func, unsupported_functions) \
-            or isinstance(sym, unsupported_functions):
-        raise SBMLException(f'Encountered unsupported expression '
-                            f'"{sym.func}" of type '
-                            f'"{type(sym.func)}" as part of a '
-                            f'{expression_type}: "{full_sym}"!')
-    for arg in list(sym.args):
-        _check_unsupported_functions(arg, expression_type)
-
-
-def _parse_special_functions(sym: sp.Expr, toplevel: bool = True) -> sp.Expr:
-    """
-    Recursively checks the symbolic expression for functions which have be
-    to parsed in a special way, such as piecewise functions
-
-    :param sym:
-        symbolic expressions
-
-    :param toplevel:
-        as this is called recursively, are we in the top level expression?
-    """
-    args = tuple(arg if arg.__class__.__name__ == 'piecewise'
-                 and sym.__class__.__name__ == 'piecewise'
-                 else _parse_special_functions(arg, False)
-                 for arg in sym.args)
-
-    fun_mappings = {
-        'times': sp.Mul,
-        'xor': sp.Xor,
-        'abs': sp.Abs,
-        'min': sp.Min,
-        'max': sp.Max,
-        'ceil': sp.functions.ceiling,
-        'floor': sp.functions.floor,
-        'factorial': sp.functions.factorial,
-        'arcsin': sp.functions.asin,
-        'arccos': sp.functions.acos,
-        'arctan': sp.functions.atan,
-        'arccot': sp.functions.acot,
-        'arcsec': sp.functions.asec,
-        'arccsc': sp.functions.acsc,
-        'arcsinh': sp.functions.asinh,
-        'arccosh': sp.functions.acosh,
-        'arctanh': sp.functions.atanh,
-        'arccoth': sp.functions.acoth,
-        'arcsech': sp.functions.asech,
-        'arccsch': sp.functions.acsch,
-    }
-
-    if sym.__class__.__name__ in fun_mappings:
-        # c++ doesnt like mixing int and double for arguments of those
-        # functions
-        if sym.__class__.__name__ in ['min', 'max']:
-            args = tuple([
-                sp.Float(arg) if arg.is_number else arg
-                for arg in sym.args
-            ])
-        else:
-            args = sym.args
-        return fun_mappings[sym.__class__.__name__](*args)
-
-    elif sym.__class__.__name__ == 'piecewise':
-        # We need to parse piecewise functions into Heavisides
-        return _parse_piecewise_to_heaviside(
-            _denest_piecewise(args)
-        )
-
-    if sym.__class__.__name__ == 'plus' and not sym.args:
-        return sp.Float(0.0)
-
-    if isinstance(sym, (sp.Function, sp.Mul, sp.Add)):
-        sym._args = args
-
-    elif toplevel and isinstance(sym, BooleanAtom):
-        # Replace boolean constants by numbers so they can be differentiated
-        #  must not replace in Piecewise function. Therefore, we only replace
-        #  it the complete expression consists only of a Boolean value.
-        sym = sp.Float(int(bool(sym)))
-
-    return sym
-
-
-def _denest_piecewise(
-        args: Sequence[Union[sp.Expr, sp.logic.boolalg.Boolean, bool]]
-) -> Tuple[Union[sp.Expr, sp.logic.boolalg.Boolean, bool]]:
-    """
-    Denest piecewise functions that contain piecewise as condition
-
-    :param args:
-        Arguments to the piecewise function
-
-    :return:
-        Arguments where conditions no longer contain piecewise functions and
-        the conditional dependency is flattened out
-    """
-    args_out = []
-    for coeff, cond in grouper(args, 2, True):
-        # handling of this case is explicitely disabled in
-        # _parse_special_functions as keeping track of coeff/cond
-        # arguments is tricky. Simpler to just parse them out here
-        if coeff.__class__.__name__ == 'piecewise':
-            coeff = _parse_special_functions(coeff, False)
-
-        # we can have conditions that are piecewise function
-        # returning True or False
-        if cond.__class__.__name__ == 'piecewise':
-            # this keeps track of conditional that the previous
-            # piece was picked
-            previous_was_picked = sp.false
-            # recursively denest those first
-            for sub_coeff, sub_cond in grouper(
-                    _denest_piecewise(cond.args), 2, True
-            ):
-                # flatten the individual pieces
-                pick_this = sp.And(
-                    sp.Not(previous_was_picked), sub_cond
-                )
-                if sub_coeff == sp.true:
-                    args_out.extend([coeff, pick_this])
-                previous_was_picked = pick_this
-
-        else:
-            args_out.extend([coeff, cond])
-    # cut off last condition as that's the default
-    return tuple(args_out[:-1])
 
 
 def _parse_piecewise_to_heaviside(args: Iterable[sp.Expr]) -> sp.Expr:
@@ -1967,49 +1872,6 @@ def _parse_event_trigger(trigger: sp.Expr) -> sp.Expr:
         'AMICI can not parse piecewise/event trigger functions with argument '
         f'{trigger}.'
     )
-
-
-def _parse_logical_operators(math_str: Union[str, float, None]
-                             ) -> Union[str, float, None]:
-    """
-    Parses a math string in order to replace logical operators by a form
-    parsable for sympy
-
-    :param math_str:
-        str with mathematical expression
-    :param math_str:
-        parsed math_str
-    """
-    if not isinstance(math_str, str):
-        return math_str
-
-    if ' xor(' in math_str or ' Xor(' in math_str:
-        raise SBMLException('Xor is currently not supported as logical '
-                            'operation.')
-
-    return (math_str.replace('&&', '&')).replace('||', '|')
-
-
-def grouper(iterable: Iterable, n: int,
-            fillvalue: Any = None) -> Iterable[Tuple[Any]]:
-    """
-    Collect data into fixed-length chunks or blocks
-
-    grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx"
-
-    :param iterable:
-        any iterable
-
-    :param n:
-        chunk length
-
-    :param fillvalue:
-        padding for last chunk if length < n
-
-    :return: itertools.zip_longest of requested chunks
-    """
-    args = [iter(iterable)] * n
-    return itt.zip_longest(*args, fillvalue=fillvalue)
 
 
 def assignmentRules2observables(sbml_model: sbml.Model,
