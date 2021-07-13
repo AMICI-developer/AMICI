@@ -26,4 +26,8 @@ python:
     - requirements: documentation/rtd_requirements.txt
 
 build:
-  image: latest
+  image: testing
+  apt_packages:
+    # for custom doxygen
+    - libclang-cpp9
+    - libclang1-9
