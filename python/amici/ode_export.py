@@ -33,6 +33,7 @@ from typing import (
 from string import Template
 from sympy.printing import cxxcode
 from sympy.printing.cxx import _CXXCodePrinterBase
+from sympy.codegen.rewriting import optimize, optims_c99
 from sympy.matrices.immutable import ImmutableDenseMatrix
 from sympy.matrices.dense import MutableDenseMatrix
 from sympy.logic.boolalg import BooleanAtom
@@ -2491,14 +2492,25 @@ def _print_with_exception(math: sp.Expr) -> str:
     # get list of custom replacements
     user_functions = {fun['sympy']: fun['c++'] for fun in CUSTOM_FUNCTIONS}
 
+    # Floating-point optimizations
+    # e.g., log(1 + x) --> logp1(x)
+    fpoptimizer = lambda x : optimize(sp.sympify(x), optims_c99)
+    if isinstance(math, list):
+        math = [fpoptimizer(expr) for expr in math]
+    else:
+        math = fpoptimizer(math)
+
     try:
         # Required until https://github.com/sympy/sympy/pull/20558 is released
         with _monkeypatched(_CXXCodePrinterBase, '_print_Max',
                             _custom_print_max),\
                 _monkeypatched(_CXXCodePrinterBase, '_print_Min',
                                _custom_print_min):
-            ret = cxxcode(math, standard='c++11',
-                          user_functions=user_functions)
+            ret = cxxcode(
+                math,
+                standard='c++11',
+                user_functions=user_functions,
+            )
         ret = re.sub(r'(^|\W)M_PI(\W|$)', r'\1amici::pi\2', ret)
         return ret
     except TypeError as e:
